@@ -14,9 +14,9 @@
 - 21025 전민건: 나는 처음 이 주제를 접할 때 날씨가 자전거 이용량에 당연히 영항을 줄것이라 생각하지만 더 정확한 데이터값이 얼마나 되는지 알아보기 위해 이 주제를 모둠원과 같이 상의하여 선정하였고 탐구해보려고 한다.
 
 ## 데이터
-- 출처(주소):서울특별시, 공공자전거 따릉이 대여이력 정보: https://data.seoul.go.kr/dataList/OA-15182/F/1/datasetView.do
+- 출처(주소):서울특별시, 공공 데이터서울시 공공자전거 따릉이 일별 대여소별 거치수량: https://data.seoul.go.kr/dataList/OA-22223/F/1/datasetView.do
 기상청, 종관기상관측(ASOS) 자료: https://data.kma.go.kr/data/grnd/selectAsosRltmList.do
-- 기간·행 수·열 수:2026년 6월 1일 ~ 2026년 6월 30일, 30행 (날짜별 관측 기록),
+- 기간·행 수·열 수:2026년 1월 1일 ~ 2026년 6월 30일, 30행 (날짜별 관측 기록),
 - 사용한 열:서울특별시, 공공자전거 따릉이 대여이력 정보: 따릉이 대여일시, 종관기상관측(ASOS) 자료: 강수량
 두 데이터의 날짜와 시간을 기준으로 결합할 예정
 - 개인 단위 정보 없음 확인: 예
@@ -62,7 +62,7 @@
 
 ## 참고문헌
 1. 데이터(1차 출처·접근일·이용 조건) 2. 소프트웨어와 생성형 AI 모델(버전) 3. 교과서
-1.서울특별시, 공공자전거 따릉이 대여이력 정보: https://data.seoul.go.kr/dataList/OA-15182/F/1/datasetView.do
+1.서울특별시, 서울시 공공자전거 따릉이 일별 대여소별 거치수량: https://data.seoul.go.kr/dataList/OA-22223/F/1/datasetView.do
 기상청, 종관기상관측(ASOS) 자료: https://data.kma.go.kr/data/grnd/selectAsosRltmList.do
 2.chat gpt
 3. 교과서 회귀, 연관, 군집에 대한 개념 정보
