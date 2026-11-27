@@ -4,12 +4,7 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-
-from io import BytesIO
-from zipfile import ZipFile
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-
+from pathlib import Path
 
 # --------------------------------------------------
 # 기본 설정
@@ -21,854 +16,489 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("🚲 비가 공용 자전거 이용량에 정말 영향을 미칠까?")
-st.markdown("""
-서울시 공공자전거 따릉이 대여이력과 기상청의 실제 관측자료를 이용해
-**강수량과 따릉이 대여량 사이의 관계**를 회귀분석합니다.
-""")
-
-st.info(
-    "분석 기간: 2026년 6월 1일 ~ 6월 30일\n\n"
-    "분석 대상: 서울시 일별 따릉이 대여 건수와 실제 일강수량"
+st.title("🚲 비가 따릉이 이용량에 영향을 미칠까?")
+st.markdown(
+    "2026년 서울시 공공자전거 대여 건수와 "
+    "기상청 시간별 강수량 자료를 이용해 관계를 분석합니다."
 )
 
+BASE_DIR = Path(__file__).parent
+
+BIKE_FILE = BASE_DIR / "서울특별시 공공자전거 일별 대여건수_26.1-6(1).csv"
+WEATHER_FILE = BASE_DIR / "OBS_ASOS_TIM_20261127133619.csv"
+
 
 # --------------------------------------------------
-# 파일 읽기 함수
+# CSV 읽기
 # --------------------------------------------------
 
-def read_csv_with_encoding(file, **kwargs):
-    """여러 인코딩을 시도해 CSV 파일을 읽습니다."""
-    encodings = ["cp949", "utf-8-sig", "utf-8"]
-
-    last_error = None
-
-    for encoding in encodings:
+@st.cache_data
+def read_csv_auto(file_path):
+    for encoding in ["cp949", "euc-kr", "utf-8-sig", "utf-8"]:
         try:
-            file.seek(0)
-            return pd.read_csv(
-                file,
-                encoding=encoding,
-                **kwargs
-            )
-        except Exception as e:
-            last_error = e
-
-    raise ValueError(f"CSV 파일을 읽을 수 없습니다: {last_error}")
-
-
-def load_weather(weather_file):
-    """기상청 일별 관측자료를 읽습니다."""
-
-    weather = read_csv_with_encoding(weather_file)
-
-    required_columns = [
-        "일시",
-        "평균기온(°C)",
-        "일강수량(mm)"
-    ]
-
-    for col in required_columns:
-        if col not in weather.columns:
-            raise ValueError(
-                f"기상자료에 '{col}' 열이 없습니다."
-            )
-
-    weather["날짜"] = pd.to_datetime(
-        weather["일시"],
-        errors="coerce"
-    ).dt.strftime("%Y-%m-%d")
-
-    numeric_columns = [
-        "평균기온(°C)",
-        "최저기온(°C)",
-        "최고기온(°C)",
-        "일강수량(mm)",
-        "평균 풍속(m/s)",
-        "평균 상대습도(%)",
-        "합계 일조시간(hr)"
-    ]
-
-    for col in numeric_columns:
-        if col in weather.columns:
-            weather[col] = pd.to_numeric(
-                weather[col],
-                errors="coerce"
-            )
-
-    # 일강수량이 비어 있는 날은 강수량이 측정되지 않은 날로 처리
-    # 원본 결측 여부는 별도 열에 보존
-    weather["강수량_원자료결측"] = (
-        weather["일강수량(mm)"].isna()
-    )
-
-    weather["일강수량(mm)"] = (
-        weather["일강수량(mm)"].fillna(0)
-    )
-
-    return weather
-
-
-def load_bike_from_zip(uploaded_file):
-    """ZIP 내부의 따릉이 CSV를 날짜별로 집계합니다."""
-
-    daily_counts = []
-
-    zip_bytes = BytesIO(uploaded_file.getvalue())
-
-    with ZipFile(zip_bytes) as archive:
-
-        csv_files = [
-            name for name in archive.namelist()
-            if name.lower().endswith(".csv")
-        ]
-
-        if not csv_files:
-            raise ValueError(
-                "ZIP 파일 안에서 CSV 파일을 찾을 수 없습니다."
-            )
-
-        csv_name = csv_files[0]
-
-        with archive.open(csv_name) as bike_file:
-
-            # 인코딩 확인
-            encoding = None
-
-            for enc in ["cp949", "utf-8-sig", "utf-8"]:
-                try:
-                    bike_file.seek(0)
-                    header = pd.read_csv(
-                        bike_file,
-                        encoding=enc,
-                        nrows=0
-                    )
-                    encoding = enc
-                    break
-                except Exception:
-                    continue
-
-            if encoding is None:
-                raise ValueError(
-                    "따릉이 CSV 파일의 인코딩을 확인할 수 없습니다."
-                )
-
-            if "대여일시" not in header.columns:
-                raise ValueError(
-                    "따릉이 자료에 '대여일시' 열이 없습니다."
-                )
-
-            bike_file.seek(0)
-
-            # 큰 파일을 여러 묶음으로 나누어 처리
-            progress = st.progress(0)
-            status = st.empty()
-
-            chunk_size = 300000
-
-            for i, chunk in enumerate(
-                pd.read_csv(
-                    bike_file,
-                    encoding=encoding,
-                    usecols=["대여일시"],
-                    chunksize=chunk_size
-                )
-            ):
-
-                dates = pd.to_datetime(
-                    chunk["대여일시"],
-                    errors="coerce"
-                )
-
-                daily = (
-                    dates.dt.strftime("%Y-%m-%d")
-                    .value_counts()
-                )
-
-                daily_counts.append(daily)
-
-                status.text(
-                    f"따릉이 대여자료 처리 중... {i + 1}번째 묶음"
-                )
-
-            progress.progress(100)
-            status.text("따릉이 자료 처리 완료!")
-
-    if not daily_counts:
-        raise ValueError("따릉이 대여자료가 비어 있습니다.")
-
-    result = (
-        pd.concat(daily_counts)
-        .groupby(level=0)
-        .sum()
-        .rename("따릉이_대여건수")
-        .reset_index()
-    )
-
-    result = result.rename(
-        columns={"index": "날짜"}
-    )
-
-    return result
-
-
-def load_bike_from_csv(uploaded_file):
-    """일반 CSV 형태의 따릉이 대여이력을 집계합니다."""
-
-    daily_counts = []
-
-    uploaded_file.seek(0)
-
-    encoding = None
-
-    for enc in ["cp949", "utf-8-sig", "utf-8"]:
-        try:
-            uploaded_file.seek(0)
-            header = pd.read_csv(
-                uploaded_file,
-                encoding=enc,
-                nrows=0
-            )
-            encoding = enc
-            break
-        except Exception:
+            return pd.read_csv(file_path, encoding=encoding)
+        except UnicodeDecodeError:
             continue
 
-    if encoding is None:
-        raise ValueError("따릉이 CSV 인코딩을 확인할 수 없습니다.")
+    raise ValueError(f"파일 인코딩을 읽을 수 없습니다: {file_path.name}")
 
-    if "대여일시" not in header.columns:
-        raise ValueError("따릉이 자료에 '대여일시' 열이 없습니다.")
 
-    uploaded_file.seek(0)
+@st.cache_data
+def load_data():
+    bike = read_csv_auto(BIKE_FILE)
+    weather = read_csv_auto(WEATHER_FILE)
 
-    progress = st.progress(0)
-    status = st.empty()
+    # 필요한 열 확인
+    required_bike = ["대여일자", "대여건수"]
+    required_weather = ["일시", "강수량(mm)"]
 
-    for i, chunk in enumerate(
-        pd.read_csv(
-            uploaded_file,
-            encoding=encoding,
-            usecols=["대여일시"],
-            chunksize=300000
+    for col in required_bike:
+        if col not in bike.columns:
+            raise ValueError(f"따릉이 파일에 '{col}' 열이 없습니다.")
+
+    for col in required_weather:
+        if col not in weather.columns:
+            raise ValueError(f"기상청 파일에 '{col}' 열이 없습니다.")
+
+    # 날짜 및 숫자 변환
+    bike["대여일자"] = pd.to_datetime(
+        bike["대여일자"], errors="coerce"
+    )
+    bike["대여건수"] = pd.to_numeric(
+        bike["대여건수"], errors="coerce"
+    )
+
+    weather["일시"] = pd.to_datetime(
+        weather["일시"], errors="coerce"
+    )
+    weather["강수량(mm)"] = pd.to_numeric(
+        weather["강수량(mm)"], errors="coerce"
+    )
+
+    bike = bike.dropna(subset=["대여일자", "대여건수"])
+    weather = weather.dropna(subset=["일시"])
+
+    # 날짜 단위로 변환
+    bike["날짜"] = bike["대여일자"].dt.normalize()
+    weather["날짜"] = weather["일시"].dt.normalize()
+
+    # 따릉이 날짜별 대여 건수
+    bike_daily = (
+        bike.groupby("날짜", as_index=False)
+        .agg(대여건수=("대여건수", "sum"))
+    )
+
+    # 기상청 날짜별 강수량 집계
+    # 결측값은 0으로 바꾸지 않음
+    weather_daily = (
+        weather.groupby("날짜")
+        .agg(
+            관측시간수=("강수량(mm)", "count"),
+            기록시간수=("일시", "size"),
+            관측강수량합계=(
+                "강수량(mm)",
+                lambda x: x.sum(min_count=1)
+            )
         )
-    ):
-
-        dates = pd.to_datetime(
-            chunk["대여일시"],
-            errors="coerce"
-        )
-
-        daily = dates.dt.strftime(
-            "%Y-%m-%d"
-        ).value_counts()
-
-        daily_counts.append(daily)
-
-        status.text(
-            f"따릉이 대여자료 처리 중... {i + 1}번째 묶음"
-        )
-
-    progress.progress(100)
-    status.text("따릉이 자료 처리 완료!")
-
-    result = (
-        pd.concat(daily_counts)
-        .groupby(level=0)
-        .sum()
-        .rename("따릉이_대여건수")
         .reset_index()
     )
 
-    result = result.rename(
-        columns={"index": "날짜"}
+    # 두 자료 결합
+    merged = pd.merge(
+        bike_daily,
+        weather_daily,
+        on="날짜",
+        how="inner"
     )
 
-    return result
+    merged = merged.sort_values("날짜")
+
+    return merged
 
 
 # --------------------------------------------------
-# 파일 업로드
+# 데이터 불러오기
 # --------------------------------------------------
 
-st.header("1. 분석 자료 업로드")
+try:
+    if not BIKE_FILE.exists():
+        st.error(f"따릉이 데이터 파일을 찾을 수 없습니다: {BIKE_FILE.name}")
+        st.stop()
 
-col1, col2 = st.columns(2)
+    if not WEATHER_FILE.exists():
+        st.error(f"기상청 데이터 파일을 찾을 수 없습니다: {WEATHER_FILE.name}")
+        st.stop()
 
-with col1:
-    weather_file = st.file_uploader(
-        "기상청 일별 관측자료 CSV",
-        type=["csv"],
-        key="weather"
+    data = load_data()
+
+except Exception as e:
+    st.error(f"데이터를 읽는 중 오류가 발생했습니다: {e}")
+    st.stop()
+
+
+# --------------------------------------------------
+# 데이터 설명
+# --------------------------------------------------
+
+st.subheader("1. 분석 데이터")
+
+col1, col2, col3 = st.columns(3)
+
+col1.metric(
+    "따릉이 전체 자료",
+    f"{data['대여건수'].notna().sum():,}일"
+)
+
+col2.metric(
+    "기상청 자료와 날짜가 겹치는 날",
+    f"{len(data):,}일"
+)
+
+valid_weather = data.dropna(subset=["관측강수량합계"]).copy()
+
+col3.metric(
+    "강수량이 확인되는 날",
+    f"{len(valid_weather):,}일"
+)
+
+if not valid_weather.empty:
+    st.write(
+        f"**분석 기간:** "
+        f"{valid_weather['날짜'].min():%Y-%m-%d} ~ "
+        f"{valid_weather['날짜'].max():%Y-%m-%d}"
     )
 
-with col2:
-    bike_file = st.file_uploader(
-        "따릉이 대여이력 ZIP 또는 CSV",
-        type=["zip", "csv"],
-        key="bike"
+    st.write(
+        f"**강수량 유효 관측시간 평균:** "
+        f"{valid_weather['관측시간수'].mean():.1f}시간 / 하루"
     )
 
+st.warning(
+    "기상청 파일은 시간별 자료이며, 관측되지 않은 시간이 많습니다. "
+    "따라서 관측된 시간 강수량의 합계가 실제 하루 전체 강수량보다 "
+    "작을 수 있습니다. 관측 강수량이 0이라고 해서 하루 종일 "
+    "비가 오지 않았다고 단정할 수 없습니다."
+)
+
+st.divider()
+
 
 # --------------------------------------------------
-# 데이터 분석 시작
+# 관측시간 필터
 # --------------------------------------------------
 
-if weather_file is not None and bike_file is not None:
+st.subheader("2. 분석 조건")
 
-    try:
+min_hours = st.slider(
+    "하루에 필요한 최소 유효 강수량 관측시간",
+    min_value=1,
+    max_value=24,
+    value=1,
+    help="관측된 시간이 적은 날짜를 분석에서 제외할 수 있습니다."
+)
 
-        with st.spinner("기상자료를 읽는 중입니다..."):
-            weather = load_weather(weather_file)
+analysis = valid_weather[
+    valid_weather["관측시간수"] >= min_hours
+].copy()
 
-        with st.spinner("따릉이 대여자료를 분석하는 중입니다..."):
+st.caption(
+    f"현재 조건으로 분석할 수 있는 날짜: {len(analysis)}일"
+)
 
-            if bike_file.name.lower().endswith(".zip"):
-                bike = load_bike_from_zip(bike_file)
-            else:
-                bike = load_bike_from_csv(bike_file)
+if len(analysis) < 3:
+    st.error(
+        "회귀분석을 하기에는 데이터가 너무 적습니다. "
+        "최소 관측시간을 낮춰 주세요."
+    )
+    st.stop()
 
-        # 날짜 기준으로 두 자료 결합
-        data = pd.merge(
-            weather,
-            bike,
-            on="날짜",
-            how="inner"
+if analysis["관측강수량합계"].nunique() < 2:
+    st.error("강수량 값이 모두 같아 회귀분석을 할 수 없습니다.")
+    st.stop()
+
+
+# --------------------------------------------------
+# 3. 회귀분석
+# --------------------------------------------------
+
+st.subheader("3. 강수량과 따릉이 대여 건수의 회귀분석")
+
+x = analysis["관측강수량합계"].to_numpy(dtype=float)
+y = analysis["대여건수"].to_numpy(dtype=float)
+
+# 선형회귀
+slope, intercept = np.polyfit(x, y, 1)
+
+predicted = slope * x + intercept
+
+# 상관계수
+correlation = np.corrcoef(x, y)[0, 1]
+
+# 결정계수
+ss_res = np.sum((y - predicted) ** 2)
+ss_tot = np.sum((y - np.mean(y)) ** 2)
+
+r_squared = (
+    1 - ss_res / ss_tot
+    if ss_tot != 0
+    else 0
+)
+
+# 회귀 그래프
+line_x = np.linspace(x.min(), x.max(), 100)
+line_y = slope * line_x + intercept
+
+fig = go.Figure()
+
+fig.add_trace(
+    go.Scatter(
+        x=x,
+        y=y,
+        mode="markers",
+        name="실제 관측값",
+        marker=dict(
+            size=9,
+            opacity=0.7
+        ),
+        text=analysis["날짜"].dt.strftime("%Y-%m-%d"),
+        hovertemplate=(
+            "날짜: %{text}<br>"
+            "관측 강수량 합계: %{x:.1f}mm<br>"
+            "따릉이 대여 건수: %{y:,.0f}건"
+            "<extra></extra>"
         )
+    )
+)
 
-        data["날짜"] = pd.to_datetime(data["날짜"])
+fig.add_trace(
+    go.Scatter(
+        x=line_x,
+        y=line_y,
+        mode="lines",
+        name="선형회귀선",
+        line=dict(width=3)
+    )
+)
 
-        # 2026년 6월만 분석
-        data = data[
-            (data["날짜"] >= "2026-06-01")
-            & (data["날짜"] <= "2026-06-30")
-        ].copy()
+fig.update_layout(
+    title="관측된 시간 강수량 합계와 따릉이 대여 건수",
+    xaxis_title="관측된 시간 강수량 합계 (mm)",
+    yaxis_title="따릉이 대여 건수 (건)",
+    hovermode="closest",
+    height=550,
+    legend=dict(orientation="h", y=1.1)
+)
 
-        data = data.sort_values("날짜")
+st.plotly_chart(fig, use_container_width=True)
 
-        if len(data) < 3:
-            st.error(
-                "분석할 날짜가 부족합니다. "
-                "두 자료의 날짜가 서로 일치하는지 확인해 주세요."
-            )
-            st.stop()
+# 회귀 결과
+c1, c2, c3, c4 = st.columns(4)
 
-        # 요일 계산
-        weekday_names = {
-            0: "월요일",
-            1: "화요일",
-            2: "수요일",
-            3: "목요일",
-            4: "금요일",
-            5: "토요일",
-            6: "일요일"
+c1.metric(
+    "회귀계수(기울기)",
+    f"{slope:,.2f}"
+)
+
+c2.metric(
+    "절편",
+    f"{intercept:,.2f}"
+)
+
+c3.metric(
+    "상관계수",
+    f"{correlation:.3f}"
+)
+
+c4.metric(
+    "결정계수 R²",
+    f"{r_squared:.3f}"
+)
+
+st.markdown("**회귀식**")
+
+st.latex(
+    rf"\hat{{y}} = {slope:.2f}x + {intercept:.2f}"
+)
+
+st.info(
+    f"관측된 시간 강수량 합계가 1mm 증가할 때 "
+    f"회귀모형은 따릉이 대여 건수가 평균적으로 "
+    f"{slope:,.2f}건 변하는 관계를 나타냅니다. "
+    "이는 회귀선의 수학적 해석이며, 실제 강수량 1mm 증가의 "
+    "인과적 효과를 의미하지는 않습니다."
+)
+
+st.caption(
+    "R²는 이 자료에서 회귀선이 대여 건수의 변동을 얼마나 설명하는지 "
+    "나타내는 값입니다. 미래 예측의 정확도를 의미하지는 않습니다."
+)
+
+st.divider()
+
+
+# --------------------------------------------------
+# 4. 강수량 구간별 비교
+# --------------------------------------------------
+
+st.subheader("4. 관측 강수량 구간별 따릉이 대여 건수 비교")
+
+# 관측 강수량 합계 기준 구간
+bins = [-0.001, 0, 1, 5, 10, 20, np.inf]
+labels = [
+    "0mm",
+    "0 초과~1mm",
+    "1 초과~5mm",
+    "5 초과~10mm",
+    "10 초과~20mm",
+    "20mm 초과"
+]
+
+analysis["강수량 구간"] = pd.cut(
+    analysis["관측강수량합계"],
+    bins=bins,
+    labels=labels,
+    include_lowest=True
+)
+
+grouped = (
+    analysis.groupby("강수량 구간", observed=False)
+    .agg(
+        평균대여건수=("대여건수", "mean"),
+        날짜수=("대여건수", "count")
+    )
+    .reset_index()
+)
+
+fig2 = px.bar(
+    grouped,
+    x="강수량 구간",
+    y="평균대여건수",
+    text="평균대여건수",
+    hover_data={
+        "날짜수": True,
+        "평균대여건수": ":,.0f"
+    },
+    title="관측 강수량 구간별 평균 따릉이 대여 건수"
+)
+
+fig2.update_traces(
+    texttemplate="%{text:,.0f}건",
+    textposition="outside"
+)
+
+fig2.update_layout(
+    xaxis_title="관측된 시간 강수량 합계 구간",
+    yaxis_title="평균 대여 건수 (건)",
+    height=450
+)
+
+st.plotly_chart(fig2, use_container_width=True)
+
+st.dataframe(
+    grouped.rename(
+        columns={
+            "강수량 구간": "관측 강수량 구간",
+            "평균대여건수": "평균 대여 건수",
+            "날짜수": "날짜 수"
         }
+    ),
+    use_container_width=True,
+    hide_index=True
+)
 
-        data["요일"] = (
-            data["날짜"].dt.dayofweek.map(weekday_names)
-        )
+st.caption(
+    "각 구간의 평균 대여 건수를 비교한 그래프입니다. "
+    "관측시간이 불완전한 날짜가 포함될 수 있으므로 "
+    "실제 강수량 구간별 비교로 단정하지 않도록 주의해야 합니다."
+)
 
-        # 비 여부
-        data["비여부"] = np.where(
-            data["일강수량(mm)"] > 0,
-            "비가 온 날",
-            "비가 오지 않은 날"
-        )
+st.divider()
 
-        st.success(
-            f"데이터 결합 완료! 총 {len(data)}일의 자료를 분석합니다."
-        )
 
-        # --------------------------------------------------
-        # 기본 데이터 확인
-        # --------------------------------------------------
+# --------------------------------------------------
+# 5. 날짜별 변화
+# --------------------------------------------------
 
-        st.header("2. 분석 자료 확인")
+st.subheader("5. 날짜별 따릉이 대여 건수 변화")
 
-        c1, c2, c3, c4 = st.columns(4)
+time_data = analysis.sort_values("날짜")
 
-        c1.metric(
-            "분석 날짜",
-            f"{len(data)}일"
-        )
+fig3 = go.Figure()
 
-        c2.metric(
-            "총 따릉이 대여",
-            f"{data['따릉이_대여건수'].sum():,}건"
-        )
-
-        c3.metric(
-            "비가 온 날",
-            f"{(data['일강수량(mm)'] > 0).sum()}일"
-        )
-
-        c4.metric(
-            "비가 오지 않은 날",
-            f"{(data['일강수량(mm)'] == 0).sum()}일"
-        )
-
-        st.subheader("날짜별 분석 데이터")
-
-        display_columns = [
-            "날짜",
-            "요일",
-            "따릉이_대여건수",
-            "일강수량(mm)",
-            "비여부",
-            "평균기온(°C)"
-        ]
-
-        display_columns = [
-            c for c in display_columns
-            if c in data.columns
-        ]
-
-        st.dataframe(
-            data[display_columns],
-            use_container_width=True,
-            hide_index=True
-        )
-
-        # --------------------------------------------------
-        # 비가 온 날과 오지 않은 날 비교
-        # --------------------------------------------------
-
-        st.header("3. 비가 온 날과 오지 않은 날의 이용량 비교")
-
-        rain_comparison = (
-            data.groupby("비여부")["따릉이_대여건수"]
-            .agg(["mean", "count"])
-            .reset_index()
-        )
-
-        rain_comparison.columns = [
-            "날씨",
-            "평균 대여 건수",
-            "날짜 수"
-        ]
-
-        no_rain = data[
-            data["일강수량(mm)"] == 0
-        ]["따릉이_대여건수"]
-
-        rain = data[
-            data["일강수량(mm)"] > 0
-        ]["따릉이_대여건수"]
-
-        a, b = st.columns(2)
-
-        with a:
-            st.metric(
-                "비가 오지 않은 날 평균 대여",
-                f"{no_rain.mean():,.0f}건"
-                if len(no_rain) else "자료 없음"
-            )
-
-        with b:
-            st.metric(
-                "비가 온 날 평균 대여",
-                f"{rain.mean():,.0f}건"
-                if len(rain) else "자료 없음"
-            )
-
-        if len(no_rain) > 0 and len(rain) > 0:
-            difference = (
-                (rain.mean() - no_rain.mean())
-                / no_rain.mean()
-                * 100
-            )
-
-            st.write(
-                f"비가 온 날의 평균 대여량은 "
-                f"비가 오지 않은 날보다 **{abs(difference):.1f}% "
-                f"{'적습니다.' if difference < 0 else '많습니다.'}**"
-            )
-
-        fig_compare = px.bar(
-            rain_comparison,
-            x="날씨",
-            y="평균 대여 건수",
-            color="날씨",
-            text_auto=".0f",
-            title="비 여부에 따른 평균 따릉이 대여 건수",
-            labels={
-                "날씨": "날씨",
-                "평균 대여 건수": "평균 대여 건수"
-            }
-        )
-
-        st.plotly_chart(
-            fig_compare,
-            use_container_width=True
-        )
-
-        # --------------------------------------------------
-        # 단순 선형회귀
-        # --------------------------------------------------
-
-        st.header("4. 단순 선형회귀 분석")
-
-        st.markdown("""
-        강수량이 따릉이 대여 건수에 어떤 관계가 있는지 분석합니다.
-
-        - 독립변수 X: 하루 강수량(mm)
-        - 종속변수 Y: 하루 따릉이 대여 건수
-        """)
-
-        X = data[["일강수량(mm)"]]
-        y = data["따릉이_대여건수"]
-
-        if X["일강수량(mm)"].nunique() < 2:
-            st.warning(
-                "강수량 값의 차이가 없어 회귀선을 계산할 수 없습니다."
-            )
-        else:
-
-            simple_model = LinearRegression()
-            simple_model.fit(X, y)
-
-            predictions = simple_model.predict(X)
-
-            slope = simple_model.coef_[0]
-            intercept = simple_model.intercept_
-
-            r2 = r2_score(y, predictions)
-            mae = mean_absolute_error(y, predictions)
-            mse = mean_squared_error(y, predictions)
-
-            r = np.corrcoef(
-                data["일강수량(mm)"],
-                data["따릉이_대여건수"]
-            )[0, 1]
-
-            m1, m2, m3, m4 = st.columns(4)
-
-            m1.metric(
-                "회귀계수",
-                f"{slope:,.1f}"
-            )
-
-            m2.metric(
-                "결정계수 R²",
-                f"{r2:.3f}"
-            )
-
-            m3.metric(
-                "상관계수",
-                f"{r:.3f}"
-            )
-
-            m4.metric(
-                "평균 절대 오차 MAE",
-                f"{mae:,.0f}"
-            )
-
-            st.write("**회귀식**")
-
-            st.latex(
-                rf"\hat{{y}} = {intercept:,.1f} "
-                rf"+ ({slope:,.1f})x"
-            )
-
-            st.write(
-                f"강수량이 1mm 증가할 때 회귀식은 "
-                f"따릉이 대여 건수가 약 **{abs(slope):,.1f}건 "
-                f"{'감소' if slope < 0 else '증가'}**하는 관계를 나타냅니다."
-            )
-
-            # 회귀선 그래프
-            x_line = np.linspace(
-                data["일강수량(mm)"].min(),
-                data["일강수량(mm)"].max(),
-                100
-            )
-
-            y_line = simple_model.predict(
-                pd.DataFrame({
-                    "일강수량(mm)": x_line
-                })
-            )
-
-            fig_reg = go.Figure()
-
-            fig_reg.add_trace(
-                go.Scatter(
-                    x=data["일강수량(mm)"],
-                    y=data["따릉이_대여건수"],
-                    mode="markers",
-                    name="실제 데이터",
-                    text=data["날짜"].dt.strftime("%Y-%m-%d"),
-                    hovertemplate=(
-                        "날짜: %{text}<br>"
-                        "강수량: %{x}mm<br>"
-                        "대여 건수: %{y:,}건"
-                        "<extra></extra>"
-                    )
-                )
-            )
-
-            fig_reg.add_trace(
-                go.Scatter(
-                    x=x_line,
-                    y=y_line,
-                    mode="lines",
-                    name="선형회귀선"
-                )
-            )
-
-            fig_reg.update_layout(
-                title="강수량과 따릉이 대여 건수의 선형회귀",
-                xaxis_title="일강수량(mm)",
-                yaxis_title="따릉이 대여 건수",
-                hovermode="closest"
-            )
-
-            st.plotly_chart(
-                fig_reg,
-                use_container_width=True
-            )
-
-            st.caption(
-                "R²는 회귀모델이 대여 건수의 변동을 설명하는 정도입니다. "
-                "높을수록 이 자료에서 회귀선의 설명력이 높다는 뜻입니다."
-            )
-
-        # --------------------------------------------------
-        # 다중 선형회귀
-        # --------------------------------------------------
-
-        st.header("5. 다중 선형회귀 분석")
-
-        st.markdown("""
-        따릉이 이용량은 비뿐만 아니라 기온과 요일에도 영향을 받을 수 있습니다.
-
-        따라서 평균기온과 요일을 함께 고려하여
-        강수량의 관계를 다시 분석합니다.
-        """)
-
-        if "평균기온(°C)" not in data.columns:
-            st.warning(
-                "평균기온 자료가 없어 다중회귀 분석을 진행할 수 없습니다."
-            )
-
-        else:
-
-            multi_data = data[
-                [
-                    "따릉이_대여건수",
-                    "일강수량(mm)",
-                    "평균기온(°C)",
-                    "요일"
-                ]
-            ].dropna()
-
-            if len(multi_data) < 5:
-                st.warning(
-                    "다중회귀 분석에 필요한 데이터가 부족합니다."
-                )
-
-            else:
-
-                # 요일을 숫자형 변수로 변환
-                weekday_dummy = pd.get_dummies(
-                    multi_data["요일"],
-                    prefix="요일",
-                    drop_first=True,
-                    dtype=int
-                )
-
-                X_multi = pd.concat(
-                    [
-                        multi_data[
-                            [
-                                "일강수량(mm)",
-                                "평균기온(°C)"
-                            ]
-                        ].reset_index(drop=True),
-                        weekday_dummy.reset_index(drop=True)
-                    ],
-                    axis=1
-                )
-
-                y_multi = multi_data[
-                    "따릉이_대여건수"
-                ]
-
-                multi_model = LinearRegression()
-                multi_model.fit(X_multi, y_multi)
-
-                multi_predictions = multi_model.predict(
-                    X_multi
-                )
-
-                multi_r2 = r2_score(
-                    y_multi,
-                    multi_predictions
-                )
-
-                multi_mae = mean_absolute_error(
-                    y_multi,
-                    multi_predictions
-                )
-
-                multi_mse = mean_squared_error(
-                    y_multi,
-                    multi_predictions
-                )
-
-                c1, c2, c3 = st.columns(3)
-
-                c1.metric(
-                    "다중회귀 R²",
-                    f"{multi_r2:.3f}"
-                )
-
-                c2.metric(
-                    "다중회귀 MAE",
-                    f"{multi_mae:,.0f}건"
-                )
-
-                c3.metric(
-                    "다중회귀 MSE",
-                    f"{multi_mse:,.0f}"
-                )
-
-                st.subheader("다중회귀 변수별 회귀계수")
-
-                coefficient_table = pd.DataFrame({
-                    "변수": X_multi.columns,
-                    "회귀계수": multi_model.coef_
-                })
-
-                coefficient_table = pd.concat(
-                    [
-                        pd.DataFrame({
-                            "변수": ["절편"],
-                            "회귀계수": [multi_model.intercept_]
-                        }),
-                        coefficient_table
-                    ],
-                    ignore_index=True
-                )
-
-                st.dataframe(
-                    coefficient_table,
-                    use_container_width=True,
-                    hide_index=True
-                )
-
-                rain_coefficient = (
-                    multi_model.coef_[
-                        list(X_multi.columns).index("일강수량(mm)")
-                    ]
-                )
-
-                st.write(
-                    f"평균기온과 요일을 함께 고려했을 때, "
-                    f"강수량의 회귀계수는 **{rain_coefficient:,.1f}**입니다."
-                )
-
-                if rain_coefficient < 0:
-                    st.info(
-                        "다른 변수들을 함께 고려한 모델에서도 "
-                        "강수량이 많을수록 대여 건수가 감소하는 관계가 나타났습니다."
-                    )
-                elif rain_coefficient > 0:
-                    st.info(
-                        "다른 변수들을 함께 고려한 모델에서는 "
-                        "강수량이 많을수록 대여 건수가 증가하는 관계가 나타났습니다."
-                    )
-                else:
-                    st.info(
-                        "다른 변수들을 함께 고려했을 때 "
-                        "강수량의 선형적인 관계가 거의 나타나지 않았습니다."
-                    )
-
-                # 실제값과 예측값 비교
-                prediction_data = pd.DataFrame({
-                    "실제 대여 건수": y_multi,
-                    "예측 대여 건수": multi_predictions
-                })
-
-                fig_prediction = px.scatter(
-                    prediction_data,
-                    x="실제 대여 건수",
-                    y="예측 대여 건수",
-                    title="다중회귀 실제값과 예측값 비교"
-                )
-
-                min_value = min(
-                    prediction_data.min().min(),
-                    prediction_data.max().min()
-                )
-
-                max_value = max(
-                    prediction_data.max().max(),
-                    prediction_data.min().max()
-                )
-
-                fig_prediction.add_trace(
-                    go.Scatter(
-                        x=[min_value, max_value],
-                        y=[min_value, max_value],
-                        mode="lines",
-                        name="완벽한 예측 기준선"
-                    )
-                )
-
-                st.plotly_chart(
-                    fig_prediction,
-                    use_container_width=True
-                )
-
-        # --------------------------------------------------
-        # 결론 및 데이터 다운로드
-        # --------------------------------------------------
-
-        st.header("6. 분석 결과 정리")
-
-        st.markdown("""
-        다음 내용을 중심으로 수행평가 결론을 작성할 수 있습니다.
-
-        1. 비가 온 날과 오지 않은 날의 평균 대여 건수 차이
-        2. 강수량과 따릉이 대여 건수의 상관관계
-        3. 단순 선형회귀에서 강수량의 회귀계수와 결정계수
-        4. 평균기온과 요일을 고려한 다중회귀 결과
-        5. 분석 결과가 실제로 비의 영향이라고 단정할 수 있는지
-        """)
-
-        st.warning(
-            "주의: 이 자료는 2026년 6월 한 달, 총 30일의 관측자료입니다. "
-            "회귀분석은 변수 사이의 관계를 보여줄 뿐, 비가 대여량 감소의 "
-            "유일한 원인이라는 것을 증명하지는 않습니다. "
-            "또한 대여 건수는 이용률 자체가 아니라 이용량을 나타냅니다."
-        )
-
-        csv_data = data.to_csv(
-            index=False,
-            encoding="utf-8-sig"
-        )
-
-        st.download_button(
-            label="분석에 사용한 데이터 CSV 다운로드",
-            data=csv_data,
-            file_name="seoul_bike_weather_analysis_202606.csv",
-            mime="text/csv"
-        )
-
-    except Exception as e:
-        st.error(
-            f"분석 중 오류가 발생했습니다: {e}"
-        )
-
-        st.info(
-            "기상청 일별 CSV와 따릉이 대여이력 ZIP 파일이 "
-            "올바른 자료인지 확인해 주세요."
-        )
-
-else:
-
-    st.info(
-        "위쪽에서 기상청 일별 관측자료 CSV와 "
-        "따릉이 대여이력 ZIP 파일을 모두 업로드하면 분석이 시작됩니다."
+fig3.add_trace(
+    go.Scatter(
+        x=time_data["날짜"],
+        y=time_data["대여건수"],
+        mode="lines+markers",
+        name="따릉이 대여 건수",
+        line=dict(width=2)
     )
+)
+
+fig3.update_layout(
+    title="날짜별 따릉이 대여 건수",
+    xaxis_title="날짜",
+    yaxis_title="대여 건수 (건)",
+    height=430
+)
+
+st.plotly_chart(fig3, use_container_width=True)
+
+
+# --------------------------------------------------
+# 6. 분석 데이터 표
+# --------------------------------------------------
+
+st.subheader("6. 실제 분석에 사용된 데이터")
+
+show_data = analysis[
+    [
+        "날짜",
+        "대여건수",
+        "관측강수량합계",
+        "관측시간수",
+        "기록시간수"
+    ]
+].copy()
+
+show_data = show_data.rename(
+    columns={
+        "날짜": "날짜",
+        "대여건수": "따릉이 대여 건수",
+        "관측강수량합계": "관측 강수량 합계(mm)",
+        "관측시간수": "유효 관측시간",
+        "기록시간수": "기록된 시간 수"
+    }
+)
+
+st.dataframe(
+    show_data,
+    use_container_width=True,
+    hide_index=True
+)
+
+csv_data = show_data.to_csv(
+    index=False,
+    encoding="utf-8-sig"
+)
+
+st.download_button(
+    label="분석 데이터 CSV 다운로드",
+    data=csv_data,
+    file_name="따릉이_강수량_회귀분석.csv",
+    mime="text/csv"
+)
+
+st.divider()
+
+st.subheader("7. 분석 결과 해석 시 주의할 점")
+
+st.markdown(
+    """
+    1. 이 분석은 강수량과 따릉이 대여 건수 사이의 **상관관계**를 확인합니다.
+    2. 회귀분석 결과만으로 비가 대여 건수 변화의 원인이라고 증명할 수는 없습니다.
+    3. 기온, 요일, 공휴일, 계절 등의 다른 요인도 대여 건수에 영향을 줄 수 있습니다.
+    4. 시간별 강수량 자료에 결측이 많으므로 하루 전체 강수량을 정확하게 반영하지 못할 수 있습니다.
+    5. 보다 정확한 분석을 위해서는 날짜별 24시간 관측이 충분히 확보된 일강수량 자료를 사용하는 것이 좋습니다.
+    """
+)
